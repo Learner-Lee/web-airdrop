@@ -1,0 +1,20 @@
+# Dependencies and generated artifacts
+**/node_modules/
+**/test-results/
+**/__pycache__/
+*.py[cod]
+*.log
+.next/
+.open-next/
+.wrangler/
+
+# Local secrets and machine-specific files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.DS_Store
+._*
+.ssh/
+.aws/
