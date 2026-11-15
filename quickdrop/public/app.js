@@ -2,10 +2,17 @@
 'use strict';
 const $ = id => document.getElementById(id);
 const MAX_FILE = 100 * 1024 * 1024, CHUNK = 16384;
+const MAX_RETAINED = 300 * 1024 * 1024;
 const state = { ws: null, pc: null, dc: null, room: new URL(location.href).searchParams.get('room'),
   candidates: [], ice: [], outgoing: null, receiving: null, sending: false, verified: false,
   peerVerified: false, sasReady: false, connected: false, generation: 0, retries: 0, reconnect: null,
-  signalQueue: Promise.resolve(), messageQueue: Promise.resolve(), urls: new Set(), receivedBytes: 0 };
+  signalQueue: Promise.resolve(), messageQueue: Promise.resolve(), urls: new Set(), receivedBytes: 0,
+  peerBatch: false, incomingBatch: null, outgoingBatch: null };
+let archiveImport;
+function archiveAPI() {
+  if (!archiveImport) archiveImport = import('./archive.js').catch(error => { archiveImport = null; throw error; });
+  return archiveImport;
+}
 let noticeTimer;
 function notify(message, permanent = false) {
   clearTimeout(noticeTimer); $('notice').textContent = message; $('notice').hidden = false;
@@ -54,10 +61,52 @@ function button(text, action, kind = 'secondary') {
   const node = document.createElement('button'); node.textContent = text; node.className = kind;
   node.addEventListener('click', action); return node;
 }
+function batchItem(files, target) {
+  const total = files.reduce((sum, file) => sum + file.size, 0);
+  const entry = item(`${target === 'inbox' ? '收到' : '发送'}一组文件（${files.length} 个）`, `共 ${formatSize(total)} · 一次确认，整组传输`, target);
+  entry.root.classList.add('batch-task');
+  entry.details = document.createElement('details'); entry.details.className = 'batch-files';
+  const summary = document.createElement('summary'); summary.textContent = `文件明细（${files.length} 个）`;
+  const list = document.createElement('ol');
+  entry.rows = files.map(file => {
+    const row = document.createElement('li'), name = document.createElement('span'), label = document.createElement('span');
+    name.className = 'batch-file-name'; name.textContent = file.name;
+    label.className = 'batch-file-state'; label.textContent = `${formatSize(file.size)} · 等待传输`;
+    row.append(name, label); list.append(row); return label;
+  });
+  entry.current = document.createElement('p'); entry.current.className = 'batch-current';
+  entry.details.append(summary, list); entry.root.append(entry.current, entry.details);
+  return entry;
+}
+function batchProgress(batch, currentBytes = 0) {
+  progress(batch.item).value = batch.total ? Math.min(1, (batch.completedBytes + currentBytes) / batch.total) : batch.completed / batch.files.length;
+}
+function stopBatchRows(batch) {
+  for (let index = batch.completed; index < batch.files.length; index++) batch.item.rows[index].textContent = '未完成';
+  batch.item.details.open = false;
+}
+function finishBatchReceive(message, kind = 'error') {
+  const batch = state.incomingBatch;
+  if (!batch) return;
+  clearTimeout(batch.timer);
+  if (state.receiving?.batch === batch) { clearTimeout(state.receiving.timer); state.receiving.chunks = []; state.receiving = null; }
+  batch.blobs = []; batch.item.actions.replaceChildren(); batch.item.current.textContent = '';
+  stopBatchRows(batch); setItemResult(batch.item, message, kind); state.incomingBatch = null;
+}
+function batchWait(batch, timeout = 180000) {
+  clearTimeout(batch.timer);
+  batch.timer = setTimeout(() => {
+    if (state.incomingBatch !== batch) return;
+    try { sendControl({ type: 'batch-error', id: batch.id }); } catch {}
+    finishBatchReceive('这组文件接收超时，请重新发送。');
+  }, timeout);
+}
 function cancelOutgoing(message) {
+  if (state.outgoingBatch) { state.outgoingBatch.abort.abort(new Error(message)); state.outgoingBatch = null; }
   if (state.outgoing) { state.outgoing.abort.abort(new Error(message)); state.outgoing = null; }
 }
 function finishReceive(message, kind = 'error') {
+  if (state.incomingBatch) { finishBatchReceive(message, kind); return; }
   const receiver = state.receiving;
   if (!receiver) return;
   clearTimeout(receiver.timer); receiver.chunks = []; receiver.item.actions.replaceChildren();
@@ -70,7 +119,7 @@ function resetPeer(message = '连接已断开，请重新配对。') {
   if (state.dc) { state.dc.onclose = null; state.dc.close(); }
   if (state.pc) { state.pc.onconnectionstatechange = null; state.pc.close(); }
   state.pc = state.dc = null; state.candidates = [];
-  state.verified = state.peerVerified = state.sasReady = false;
+  state.verified = state.peerVerified = state.sasReady = state.peerBatch = false;
   $('verify').disabled = false; $('verify').textContent = '配对码一致，确认连接';
   $('peer-status').textContent = '等待加入'; setReady();
 }
@@ -134,7 +183,7 @@ async function showSAS(pc) {
 function configureChannel(dc, pc) {
   if (state.pc !== pc) return;
   state.dc = dc; dc.binaryType = 'arraybuffer'; dc.bufferedAmountLowThreshold = 262144;
-  dc.onopen = () => { showSAS(pc).catch(err => { notify(err.message, true); resetPeer(); }); };
+  dc.onopen = () => { sendControl({ type: 'hello', features: ['batch-v1'] }); showSAS(pc).catch(err => { notify(err.message, true); resetPeer(); }); };
   dc.onclose = () => { if (state.dc === dc) { resetPeer(); status('连接中断'); notify('对方已断开连接。双方保持页面打开，并重新配对。', true); } };
   dc.onerror = () => { if (state.dc === dc) notify('传输通道发生错误，请重试。'); };
   dc.onmessage = event => {
@@ -145,7 +194,10 @@ function configureChannel(dc, pc) {
         let message; try { message = JSON.parse(event.data); } catch { return; }
         if (message && typeof message === 'object') await control(message);
       } else await binary(event.data);
-    }).catch(err => { notify(err.message || '接收失败，请重试。'); finishReceive('接收失败，请重新发送。'); });
+    }).catch(err => {
+      try { if (state.incomingBatch) sendControl({ type: 'batch-error', id: state.incomingBatch.id }); else if (state.receiving) sendControl({ type: 'file-error', id: state.receiving.id }); } catch {}
+      notify(err.message || '接收失败，请重试。'); finishReceive('接收失败，请重新发送。');
+    });
   };
 }
 function touchReceive(receiver) {
@@ -157,8 +209,10 @@ function touchReceive(receiver) {
   }, 90000);
 }
 async function control(message) {
+  if (message.type === 'hello') { state.peerBatch = Array.isArray(message.features) && message.features.includes('batch-v1'); return; }
   if (message.type === 'verify') { state.peerVerified = true; setReady(); return; }
   if (!state.connected) return;
+  if (typeof message.type === 'string' && message.type.startsWith('batch-')) { await batchControl(message); return; }
   const current = state.outgoing;
   if (message.type === 'file-accept' && current?.id === message.id) current.accept.resolve();
   else if (message.type === 'file-reject' && current?.id === message.id) current.abort.abort(new Error('对方拒绝了文件。'));
@@ -172,8 +226,22 @@ async function control(message) {
   } else if (message.type === 'file-meta') {
     if (typeof message.id !== 'string' || message.id.length > 80 || typeof message.name !== 'string' || message.name.length > 512 ||
       !Number.isSafeInteger(message.size) || message.size < 0 || message.size > MAX_FILE || !/^[a-f0-9]{64}$/.test(message.hash || '')) return;
+    if (state.incomingBatch || message.batch) {
+      const batch = state.incomingBatch, expected = batch?.files[batch.completed];
+      if (!batch?.accepted || message.batch !== batch.id || state.receiving || !expected || expected.id !== message.id || expected.name !== message.name || expected.size !== message.size) {
+        sendControl({ type: 'file-reject', id: message.id });
+        if (batch) { sendControl({ type: 'batch-error', id: batch.id }); finishBatchReceive('这组文件的内容与确认清单不一致，已停止接收。'); }
+        return;
+      }
+      clearTimeout(batch.timer);
+      const receiver = { ...message, item: batch.item, chunks: [], bytes: 0, accepted: true, batch, crc32: 0 };
+      state.receiving = receiver;
+      batch.item.rows[batch.completed].textContent = '正在接收…';
+      batch.item.current.textContent = `正在接收 ${batch.completed + 1}/${batch.files.length}：${message.name}`;
+      sendControl({ type: 'file-accept', id: message.id }); touchReceive(receiver); return;
+    }
     // Cap retained downloads so repeated accepted transfers cannot grow browser memory without bound.
-    if (state.receiving || state.receivedBytes + message.size > 300 * 1024 * 1024) {
+    if (state.receiving || state.receivedBytes + message.size > MAX_RETAINED) {
       sendControl({ type: 'file-reject', id: message.id }); notify('请先完成当前接收；本页最多暂存 300 MiB，保存文件后可刷新重新配对。'); return;
     }
     const entry = item(message.name || '未命名文件', `${formatSize(message.size)} · 来自另一台设备`);
@@ -201,11 +269,84 @@ async function control(message) {
     if (hash !== receiver.hash) {
       sendControl({ type: 'file-error', id: receiver.id }); finishReceive('文件校验失败，请重新发送。'); return;
     }
+    if (receiver.batch) {
+      const batch = receiver.batch;
+      batch.blobs.push({ name: receiver.name, blob, crc32: receiver.crc32 });
+      batch.item.rows[batch.completed].textContent = `${formatSize(receiver.size)} · 校验通过`;
+      batch.completed++; batch.completedBytes += receiver.size; state.receiving = null;
+      batchProgress(batch); setItemResult(batch.item, `已校验 ${batch.completed}/${batch.files.length} 个文件`);
+      sendControl({ type: 'file-ok', id: receiver.id }); batchWait(batch); return;
+    }
     const url = URL.createObjectURL(blob); state.urls.add(url); state.receivedBytes += receiver.size;
     const link = document.createElement('a'); link.href = url; link.download = receiver.name.replace(/[\/\\\x00-\x1f]/g, '_') || 'download';
     link.textContent = '下载保存 ↓'; link.className = 'download'; receiver.item.actions.replaceChildren(link);
     progress(receiver.item).value = 1; setItemResult(receiver.item, '已接收 · SHA-256 校验通过，请点击下载保存。', 'success');
     sendControl({ type: 'file-ok', id: receiver.id }); state.receiving = null;
+  }
+}
+async function batchControl(message) {
+  const outgoing = state.outgoingBatch;
+  if (outgoing?.id === message.id) {
+    if (message.type === 'batch-accept') outgoing.accept.resolve();
+    else if (message.type === 'batch-ok') outgoing.done.resolve();
+    else if (message.type === 'batch-reject') outgoing.abort.abort(new Error('对方拒绝了这组文件。'));
+    else if (message.type === 'batch-error' || message.type === 'batch-cancel') outgoing.abort.abort(new Error('这组文件未能完整接收，请重新发送。'));
+    return;
+  }
+  if (message.type === 'batch-meta') {
+    const validId = value => typeof value === 'string' && value.length > 0 && value.length <= 80;
+    const files = message.files;
+    if (!validId(message.id) || !Array.isArray(files) || files.length < 2 || files.length > 50 ||
+      new TextEncoder().encode(JSON.stringify(message)).length > 48000 ||
+      !files.every(file => file && validId(file.id) && typeof file.name === 'string' && file.name.length > 0 && file.name.length <= 512 && Number.isSafeInteger(file.size) && file.size >= 0 && file.size <= MAX_FILE) ||
+      new Set(files.map(file => file.id)).size !== files.length || !Number.isSafeInteger(message.total) ||
+      message.total !== files.reduce((sum, file) => sum + file.size, 0) || message.total > MAX_RETAINED) {
+      if (validId(message.id)) sendControl({ type: 'batch-reject', id: message.id });
+      notify('这组文件的清单或大小不符合要求，已拒绝接收。'); return;
+    }
+    if (state.receiving || state.incomingBatch || state.receivedBytes + message.total > MAX_RETAINED) {
+      sendControl({ type: 'batch-reject', id: message.id }); notify('请先完成当前接收；本页最多暂存 300 MiB 文件，保存后可刷新重新配对。'); return;
+    }
+    const entry = batchItem(files, 'inbox'); entry.root.dataset.batchId = message.id;
+    const batch = { id: message.id, files, total: message.total, item: entry, blobs: [], completed: 0, completedBytes: 0, accepted: false };
+    state.incomingBatch = batch; batchWait(batch, 90000); setItemResult(entry, '正在准备整组接收…');
+    try { batch.archive = await archiveAPI(); }
+    catch {
+      if (state.incomingBatch === batch) { sendControl({ type: 'batch-reject', id: batch.id }); finishBatchReceive('打包组件加载失败，请刷新页面后重试。'); }
+      return;
+    }
+    if (state.incomingBatch !== batch) return;
+    setItemResult(entry, '是否接收这组文件？确认一次即可接收整组，请仅接收你信任的内容。');
+    entry.actions.append(button(`接收这组文件（${files.length} 个）`, () => {
+      if (state.incomingBatch !== batch || batch.accepted) return;
+      batch.accepted = true; entry.details.open = false; progress(entry);
+      entry.actions.replaceChildren(button('取消接收', () => {
+        if (state.incomingBatch !== batch) return;
+        sendControl({ type: 'batch-cancel', id: batch.id }); finishBatchReceive('已取消接收这组文件。', '');
+      }));
+      setItemResult(entry, '已确认接收整组，等待发送…'); sendControl({ type: 'batch-accept', id: batch.id }); batchWait(batch);
+    }, 'primary'), button('拒绝', () => {
+      if (state.incomingBatch !== batch || batch.accepted) return;
+      sendControl({ type: 'batch-reject', id: batch.id }); finishBatchReceive('已拒绝接收这组文件。', '');
+    }));
+  } else if (state.incomingBatch?.id === message.id) {
+    const batch = state.incomingBatch;
+    if (message.type === 'batch-cancel' || message.type === 'batch-error') { finishBatchReceive('这组传输已停止，没有生成下载压缩包。'); return; }
+    if (message.type !== 'batch-done') return;
+    if (!batch.accepted || state.receiving || batch.completed !== batch.files.length || batch.completedBytes !== batch.total) {
+      sendControl({ type: 'batch-error', id: batch.id }); finishBatchReceive('这组文件未接收完整，没有生成下载压缩包。'); return;
+    }
+    clearTimeout(batch.timer); setItemResult(batch.item, '全部校验通过，正在生成压缩包…');
+    const folder = `QuickDrop-${new Date().toISOString().replace(/[-:]/g, '').slice(0, 15).replace('T', '-')}-${batch.id.slice(0, 6)}`;
+    const zip = batch.archive.createZip(batch.blobs, folder);
+    const url = URL.createObjectURL(zip); state.urls.add(url); state.receivedBytes += batch.total;
+    const link = document.createElement('a'); link.href = url; link.download = `${folder}.zip`; link.className = 'download'; link.textContent = '打包下载 ZIP ↓';
+    batch.item.actions.replaceChildren(link); progress(batch.item).value = 1; batch.item.details.open = false;
+    batch.item.current.textContent = '解压后是一个文件夹，内含这次传输的全部文件。';
+    setItemResult(batch.item, `${batch.files.length} 个文件全部接收并校验通过，请统一下载保存。`, 'success');
+    batch.blobs = []; state.incomingBatch = null;
+    // A lost acknowledgement must not remove an already verified ZIP download.
+    try { sendControl({ type: 'batch-ok', id: batch.id }); } catch {}
   }
 }
 async function binary(data) {
@@ -215,8 +356,15 @@ async function binary(data) {
     sendControl({ type: 'file-error', id: receiver.id }); finishReceive('收到异常文件数据，已停止接收。'); return;
   }
   receiver.chunks.push(data); receiver.bytes += data.byteLength;
-  progress(receiver.item).value = receiver.size ? receiver.bytes / receiver.size : 1;
-  setItemResult(receiver.item, `${formatSize(receiver.bytes)} / ${formatSize(receiver.size)}`); touchReceive(receiver);
+  if (receiver.batch) {
+    receiver.crc32 = receiver.batch.archive.updateCrc32(receiver.crc32, new Uint8Array(data));
+    batchProgress(receiver.batch, receiver.bytes);
+    setItemResult(receiver.item, `${formatSize(receiver.batch.completedBytes + receiver.bytes)} / ${formatSize(receiver.batch.total)} · 已校验 ${receiver.batch.completed}/${receiver.batch.files.length} 个`);
+  } else {
+    progress(receiver.item).value = receiver.size ? receiver.bytes / receiver.size : 1;
+    setItemResult(receiver.item, `${formatSize(receiver.bytes)} / ${formatSize(receiver.size)}`);
+  }
+  touchReceive(receiver);
 }
 async function sha256(data) { return [...new Uint8Array(await crypto.subtle.digest('SHA-256', data))].map(value => value.toString(16).padStart(2, '0')).join(''); }
 function deferred() { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; }
@@ -245,19 +393,21 @@ function waitBuffer(dc, signal) {
     if (dc.bufferedAmount <= dc.bufferedAmountLowThreshold) low();
   });
 }
-async function sendOne(file) {
-  const entry = item(file.name, formatSize(file.size), 'outgoing');
+async function sendOne(file, batch = null) {
+  const entry = batch ? batch.item : item(file.name, formatSize(file.size), 'outgoing');
   if (file.size > MAX_FILE) { setItemResult(entry, '超过单文件 100 MiB 上限。', 'error'); return; }
-  const transfer = { id: crypto.randomUUID(), abort: new AbortController(), accept: deferred(), done: deferred() };
+  const transfer = { id: batch ? batch.files[batch.completed].id : crypto.randomUUID(), abort: batch ? batch.abort : new AbortController(), accept: deferred(), done: deferred() };
   state.outgoing = transfer;
   const dc = state.dc, generation = state.generation;
-  const cancel = button('取消', () => transfer.abort.abort(new Error('已取消发送。'))); entry.actions.append(cancel);
+  const cancel = batch ? null : button('取消', () => transfer.abort.abort(new Error('已取消发送。')));
+  if (cancel) entry.actions.append(cancel);
   try {
+    if (batch) { entry.current.textContent = `正在发送 ${batch.completed + 1}/${batch.files.length}：${file.name}`; entry.rows[batch.completed].textContent = '准备发送…'; }
     setItemResult(entry, '正在计算文件校验值…');
     const hash = await waitFor(file.arrayBuffer().then(sha256), transfer.abort.signal, 90000, '文件读取超时。');
     if (generation !== state.generation) throw new Error('连接已改变，请重新发送。');
-    sendControl({ type: 'file-meta', id: transfer.id, name: file.name, size: file.size, hash });
-    setItemResult(entry, '等待对方接收…');
+    sendControl({ type: 'file-meta', id: transfer.id, name: file.name, size: file.size, hash, ...(batch ? { batch: batch.id } : {}) });
+    setItemResult(entry, batch ? '整组已获接收确认，正在传输…' : '等待对方接收…');
     await waitFor(transfer.accept.promise, transfer.abort.signal, 90000, '对方未确认接收，请重试。');
     const started = performance.now();
     for (let offset = 0; offset < file.size; offset += CHUNK) {
@@ -265,23 +415,63 @@ async function sendOne(file) {
       const chunk = await file.slice(offset, offset + CHUNK).arrayBuffer();
       if (transfer.abort.signal.aborted) throw transfer.abort.signal.reason;
       if (state.dc !== dc || dc.readyState !== 'open') throw new Error('连接已断开。');
-      dc.send(chunk); progress(entry).value = Math.min(1, (offset + chunk.byteLength) / file.size);
-      setItemResult(entry, `${formatSize(Math.min(file.size, offset + chunk.byteLength))} / ${formatSize(file.size)} · 发送中`);
+      dc.send(chunk);
+      const sent = Math.min(file.size, offset + chunk.byteLength);
+      if (batch) {
+        batchProgress(batch, sent); entry.rows[batch.completed].textContent = `${formatSize(sent)} / ${formatSize(file.size)}`;
+        setItemResult(entry, `${formatSize(batch.completedBytes + sent)} / ${formatSize(batch.total)} · 已校验 ${batch.completed}/${batch.files.length} 个`);
+      } else {
+        progress(entry).value = Math.min(1, sent / file.size);
+        setItemResult(entry, `${formatSize(sent)} / ${formatSize(file.size)} · 发送中`);
+      }
     }
     sendControl({ type: 'file-done', id: transfer.id }); setItemResult(entry, '数据已发送，等待对方校验…');
     await waitFor(transfer.done.promise, transfer.abort.signal, 180000, '等待对方完成超时，请重试。');
-    progress(entry).value = 1;
-    setItemResult(entry, `对方已接收并通过校验 · ${((performance.now() - started) / 1000).toFixed(1)} 秒 · 等待对方自行下载保存`, 'success');
+    if (batch) {
+      entry.rows[batch.completed].textContent = `${formatSize(file.size)} · 对方校验通过`;
+      batch.completed++; batch.completedBytes += file.size; batchProgress(batch);
+    } else {
+      progress(entry).value = 1;
+      setItemResult(entry, `对方已接收并通过校验 · ${((performance.now() - started) / 1000).toFixed(1)} 秒 · 等待对方自行下载保存`, 'success');
+    }
   } catch (err) {
+    if (batch) throw err;
     setItemResult(entry, err.message || '发送失败。', 'error');
     if (state.dc === dc && dc?.readyState === 'open') { try { sendControl({ type: 'file-cancel', id: transfer.id }); } catch {} }
-  } finally { cancel.remove(); if (state.outgoing === transfer) state.outgoing = null; }
+  } finally { cancel?.remove(); if (state.outgoing === transfer) state.outgoing = null; }
+}
+async function sendBatch(files) {
+  const entry = batchItem(files, 'outgoing');
+  const batch = { id: crypto.randomUUID(), files: files.map(file => ({ id: crypto.randomUUID(), name: file.name, size: file.size })),
+    total: files.reduce((sum, file) => sum + file.size, 0), item: entry, completed: 0, completedBytes: 0,
+    abort: new AbortController(), accept: deferred(), done: deferred() };
+  entry.root.dataset.batchId = batch.id;
+  if (files.some(file => file.size > MAX_FILE)) { setItemResult(entry, '这组包含超过 100 MiB 的文件，整组未发送。', 'error'); return; }
+  if (batch.total > MAX_RETAINED) { setItemResult(entry, '这组文件总大小超过 300 MiB，请分组发送。', 'error'); return; }
+  const meta = { type: 'batch-meta', id: batch.id, total: batch.total, files: batch.files };
+  if (new TextEncoder().encode(JSON.stringify(meta)).length > 48000) { setItemResult(entry, '文件名清单过长，请减少文件数量后重试。', 'error'); return; }
+  state.outgoingBatch = batch;
+  const dc = state.dc;
+  const cancel = button('取消整组发送', () => batch.abort.abort(new Error('已取消这组文件的发送。'))); entry.actions.append(cancel);
+  try {
+    sendControl(meta); setItemResult(entry, '等待对方一次确认接收整组…');
+    await waitFor(batch.accept.promise, batch.abort.signal, 90000, '对方未确认接收这组文件，请重试。');
+    for (const file of files) await sendOne(file, batch);
+    sendControl({ type: 'batch-done', id: batch.id }); setItemResult(entry, '全部文件已发送，等待对方生成压缩包…');
+    await waitFor(batch.done.promise, batch.abort.signal, 180000, '等待整组完成确认超时，请重试。');
+    entry.current.textContent = ''; entry.details.open = false;
+    setItemResult(entry, `对方已接收 ${files.length} 个文件并通过全部校验，可统一下载压缩包。`, 'success');
+  } catch (err) {
+    stopBatchRows(batch); entry.current.textContent = ''; setItemResult(entry, err.message || '这组文件发送失败。', 'error');
+    if (state.dc === dc && dc?.readyState === 'open') { try { sendControl({ type: 'batch-cancel', id: batch.id }); } catch {} }
+  } finally { cancel.remove(); if (state.outgoingBatch === batch) state.outgoingBatch = null; }
 }
 async function sendFiles(files) {
-  if (!state.connected || state.sending) return;
+  if (!files.length || !state.connected || state.sending) return;
   if (files.length > 50) { notify('一次最多选择 50 个文件。'); return; }
+  if (files.length > 1 && !state.peerBatch) { notify('对方仍在使用旧版页面，请双方刷新并重新配对后使用整组传输。'); return; }
   state.sending = true; setReady();
-  try { for (const file of files) { if (!state.connected) break; await sendOne(file); } }
+  try { if (files.length > 1) await sendBatch(files); else await sendOne(files[0]); }
   finally { state.sending = false; $('files').value = ''; setReady(); }
 }
 async function copy(value) {
@@ -328,7 +518,7 @@ $('verify').addEventListener('click', () => {
   $('verify').disabled = true; $('verify').textContent = '已确认，等待另一台设备确认…'; setReady();
 });
 $('new-room').addEventListener('click', () => {
-  if ((state.sending || state.receiving) && !confirm('新建房间会中止当前传输，确定继续？')) return;
+  if ((state.sending || state.receiving || state.incomingBatch) && !confirm('新建房间会中止当前传输，确定继续？')) return;
   resetPeer('已新建房间，当前传输已中止。');
   if (state.ws?.readyState === WebSocket.OPEN) state.ws.send(JSON.stringify({ type: 'create' }));
   else { if (state.ws) { state.ws.onclose = null; state.ws.close(); } state.room = null; connect(); }
@@ -346,7 +536,7 @@ $('send-text').addEventListener('click', () => {
   if (new TextEncoder().encode(text).length > 32768) return notify('文字超过 32 KiB，请缩短后发送。');
   sendControl({ type: 'text', text }); $('text').value = ''; $('text-count').textContent = '0 / 32 KiB'; notify('文字已发送。');
 });
-window.addEventListener('beforeunload', event => { if (state.sending || state.receiving) { event.preventDefault(); event.returnValue = ''; } });
+window.addEventListener('beforeunload', event => { if (state.sending || state.receiving || state.incomingBatch) { event.preventDefault(); event.returnValue = ''; } });
 if (!window.RTCPeerConnection || !window.crypto?.subtle || !window.isSecureContext) {
   status('浏览器不支持'); notify('请使用最新版 Safari、Chrome 或 Edge，并通过 HTTPS 打开本页。', true); $('new-room').disabled = true;
 } else connect();
