@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, open, readFile, writeFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 const { chromium } = await import('playwright').catch(() => import('/tmp/quickdrop-test-tools/node_modules/playwright/index.mjs'));
 
@@ -94,8 +94,8 @@ async function groupedTransfer() {
   await entry.locator('summary').click(); assert.equal(await entry.locator('details').getAttribute('open'), '');
   await entry.getByRole('button', { name: '接收这组文件（4 个）' }).click();
   assert.equal(await entry.locator('details').getAttribute('open'), null);
-  const zip = await checkZip(entry, files);
-  assert.ok(zip[2].name.endsWith('/中文报告 (2).txt'));
+  const zip = await checkZip(entry, [files[2], files[3], files[0], files[1]]);
+  assert.ok(zip[4].name.endsWith('/中文报告 (2).txt'));
   assert.equal(await entry.locator('details').getAttribute('open'), null);
   assert.equal(await b.locator('#inbox > .item').count(), beforeIn + 1); assert.equal(await a.locator('#outgoing > .item').count(), beforeOut + 1);
   await a.waitForFunction(() => !document.getElementById('files').disabled);
@@ -163,12 +163,12 @@ try {
       await a.evaluate(() => {
         window.__originalBatchSend = RTCDataChannel.prototype.send; window.__corruptBatch = false;
         RTCDataChannel.prototype.send = function(data) {
-          if (typeof data === 'string') { const message = JSON.parse(data); if (message.type === 'file-meta' && message.name === 'corrupt-batch.bin') window.__corruptBatch = true; }
+          if (typeof data === 'string') { const message = JSON.parse(data); if (message.type === 'file-meta' && message.name === '02-corrupt-batch.bin') window.__corruptBatch = true; }
           if (window.__corruptBatch && data instanceof ArrayBuffer && data.byteLength) { window.__corruptBatch = false; const bytes = data.slice(0); new Uint8Array(bytes)[0] ^= 1; return window.__originalBatchSend.call(this, bytes); }
           return window.__originalBatchSend.call(this, data);
         };
       });
-      await selectBatch(a, [{ name: 'valid.txt', data: Buffer.from('valid') }, { name: 'corrupt-batch.bin', data: sample(65536) }]);
+      await selectBatch(a, [{ name: '01-valid.txt', data: Buffer.from('valid') }, { name: '02-corrupt-batch.bin', data: sample(65536) }]);
       const entry = b.locator('#inbox > .batch-task').first();
       await entry.getByRole('button', { name: '接收这组文件（2 个）' }).click();
       await entry.getByText('文件校验失败，请重新发送。', { exact: true }).waitFor();
@@ -210,12 +210,42 @@ try {
       await a.evaluate(() => { RTCDataChannel.prototype.send = window.__beforeMismatchSend; });
     });
     await run('50 MiB binary transfer and downloaded hash verification', () => transfer(a, b, '视频样本-50MiB.bin', sample(50 * 1048576)));
+    await run('Automatic natural-name groups continue into a one-file final group', async () => {
+      const files = Array.from({ length: 51 }, (_, index) => ({ name: `自动分组${51 - index}.txt`, data: Buffer.from(`payload-${51 - index}`) }));
+      const before = await b.locator('#inbox > .batch-task').count();
+      await selectBatch(a, files);
+      const first = b.locator('#inbox > .batch-task[data-part-index="1"][data-part-total="2"]').last();
+      await first.getByRole('button', { name: '接收这组文件（50 个）' }).click();
+      const zip1 = await checkZip(first, files.slice(1).reverse());
+      assert.ok(zip1[1].name.endsWith('/自动分组1.txt')); assert.ok(zip1[50].name.endsWith('/自动分组50.txt'));
+      assert.match(zip1[0].name, /-第1组-/);
+      const second = b.locator('#inbox > .batch-task[data-part-index="2"][data-part-total="2"]').last();
+      await second.getByRole('button', { name: '接收这组文件（1 个）' }).click();
+      const zip2 = await checkZip(second, [files[0]]); assert.ok(zip2[1].name.endsWith('/自动分组51.txt'));
+      assert.match(zip2[0].name, /-第2组-/);
+      assert.equal(await b.locator('#inbox > .batch-task').count(), before + 2);
+      const titles = await b.locator('#inbox > .batch-task[data-part-total="2"] > strong').allTextContents();
+      assert.match(titles[0], /第 1\/2 组/); assert.match(titles[1], /第 2\/2 组/);
+      await a.waitForFunction(() => !document.getElementById('files').disabled);
+      b.once('dialog', dialog => dialog.accept()); await first.getByRole('button', { name: '释放缓存', exact: true }).click();
+      assert.equal(await first.locator('a.download').count(), 0);
+      await first.getByText('本任务缓存已释放，如需再次下载请重新发送。', { exact: true }).waitFor();
+      assert.equal(await second.locator('a.download').count(), 1);
+    });
+    await run('Rejecting an automatic group stops the remaining groups', async () => {
+      const before = await b.locator('#inbox > .batch-task').count();
+      await selectBatch(a, Array.from({ length: 51 }, (_, index) => ({ name: `停止${index + 1}.txt`, data: Buffer.from('stop') })));
+      const first = b.locator('#inbox > .batch-task').first();
+      await first.getByRole('button', { name: '拒绝', exact: true }).click();
+      await a.waitForFunction(() => !document.getElementById('files').disabled);
+      await a.getByText('本组未完成，后续 1 组已停止发送。', { exact: true }).waitFor();
+      assert.equal(await b.locator('#inbox > .batch-task').count(), before + 1);
+    });
     await run('Oversize file refused before sending', async () => {
-      await a.evaluate(() => {
-        const chunk = new Uint8Array(1048576); const file = new File(Array(101).fill(chunk), 'too-large.bin');
-        const dt = new DataTransfer(); dt.items.add(file); const input = document.getElementById('files'); input.files = dt.files; input.dispatchEvent(new Event('change', { bubbles: true }));
-      });
-      await a.getByText('超过单文件 100 MiB 上限。', { exact: true }).waitFor();
+      const folder = await mkdtemp('/tmp/quickdrop-limit-'), path = `${folder}/too-large.bin`;
+      const handle = await open(path, 'w'); await handle.truncate(512 * 1048576 + 1); await handle.close();
+      await a.locator('#files').setInputFiles(path);
+      await a.getByText(/超过单文件 512 MiB 上限/).waitFor();
     });
     await run('Third device rejected and invalid room explained', async () => {
       const third = await page(); await third.goto(pairUrl); await third.getByText('房间已满，最多连接两台设备。', { exact: true }).waitFor();

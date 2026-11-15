@@ -1,13 +1,13 @@
 /* QuickDrop: all file and text payloads travel over the encrypted DataChannel. */
 'use strict';
+import { MAX_FILE_SIZE as MAX_FILE, MAX_BATCH_SIZE as MAX_BATCH, MAX_BATCH_FILES, MIB, planTransfers } from './transfer-plan.js';
 const $ = id => document.getElementById(id);
-const MAX_FILE = 100 * 1024 * 1024, CHUNK = 16384;
-const MAX_RETAINED = 300 * 1024 * 1024;
+const CHUNK = 16384;
 const state = { ws: null, pc: null, dc: null, room: new URL(location.href).searchParams.get('room'),
   candidates: [], ice: [], outgoing: null, receiving: null, sending: false, verified: false,
   peerVerified: false, sasReady: false, connected: false, generation: 0, retries: 0, reconnect: null,
   signalQueue: Promise.resolve(), messageQueue: Promise.resolve(), urls: new Set(), receivedBytes: 0,
-  peerBatch: false, incomingBatch: null, outgoingBatch: null };
+  peerBatch: false, peerLargeFiles: false, incomingBatch: null, outgoingBatch: null };
 let archiveImport;
 function archiveAPI() {
   if (!archiveImport) archiveImport = import('./archive.js').catch(error => { archiveImport = null; throw error; });
@@ -61,10 +61,31 @@ function button(text, action, kind = 'secondary') {
   const node = document.createElement('button'); node.textContent = text; node.className = kind;
   node.addEventListener('click', action); return node;
 }
-function batchItem(files, target) {
+function retainedHint() {
+  $('retained-hint').textContent = state.receivedBytes ? `本页缓存 ${formatSize(state.receivedBytes)} · 保存后可释放` : '仅保留在当前页面';
+}
+function attachDownload(entry, blob, filename, label, bytes) {
+  const url = URL.createObjectURL(blob); state.urls.add(url); state.receivedBytes += bytes; retainedHint();
+  const link = document.createElement('a'); link.href = url; link.download = filename; link.className = 'download'; link.textContent = label;
+  const release = button('释放缓存', () => {
+    if (!state.urls.has(url) || !confirm(`请确认“${filename}”已经下载保存。释放缓存后，本页将不能再次下载这个任务，是否继续？`)) return;
+    URL.revokeObjectURL(url); state.urls.delete(url); state.receivedBytes = Math.max(0, state.receivedBytes - bytes); retainedHint();
+    const note = document.createElement('span'); note.className = 'muted small'; note.textContent = '本任务缓存已释放，如需再次下载请重新发送。';
+    entry.actions.replaceChildren(note);
+  });
+  entry.actions.replaceChildren(link, release);
+}
+function batchItem(files, target, part = null) {
   const total = files.reduce((sum, file) => sum + file.size, 0);
-  const entry = item(`${target === 'inbox' ? '收到' : '发送'}一组文件（${files.length} 个）`, `共 ${formatSize(total)} · 一次确认，整组传输`, target);
+  const prefix = target === 'inbox' ? '收到' : '发送';
+  const title = part?.total > 1 ? `${prefix}第 ${part.index}/${part.total} 组（${files.length} 个文件）` : `${prefix}一组文件（${files.length} 个）`;
+  const entry = item(title, `共 ${formatSize(total)} · 一次确认，整组传输`, target);
   entry.root.classList.add('batch-task');
+  if (part) {
+    entry.root.dataset.selectionId = part.id; entry.root.dataset.partIndex = part.index; entry.root.dataset.partTotal = part.total;
+    const siblings = [...$(target).querySelectorAll('.batch-task')].filter(node => node !== entry.root && node.dataset.selectionId === part.id);
+    if (siblings.length) siblings[siblings.length - 1].after(entry.root);
+  }
   entry.details = document.createElement('details'); entry.details.className = 'batch-files';
   const summary = document.createElement('summary'); summary.textContent = `文件明细（${files.length} 个）`;
   const list = document.createElement('ol');
@@ -119,7 +140,7 @@ function resetPeer(message = '连接已断开，请重新配对。') {
   if (state.dc) { state.dc.onclose = null; state.dc.close(); }
   if (state.pc) { state.pc.onconnectionstatechange = null; state.pc.close(); }
   state.pc = state.dc = null; state.candidates = [];
-  state.verified = state.peerVerified = state.sasReady = state.peerBatch = false;
+  state.verified = state.peerVerified = state.sasReady = state.peerBatch = state.peerLargeFiles = false;
   $('verify').disabled = false; $('verify').textContent = '配对码一致，确认连接';
   $('peer-status').textContent = '等待加入'; setReady();
 }
@@ -183,7 +204,7 @@ async function showSAS(pc) {
 function configureChannel(dc, pc) {
   if (state.pc !== pc) return;
   state.dc = dc; dc.binaryType = 'arraybuffer'; dc.bufferedAmountLowThreshold = 262144;
-  dc.onopen = () => { sendControl({ type: 'hello', features: ['batch-v1'] }); showSAS(pc).catch(err => { notify(err.message, true); resetPeer(); }); };
+  dc.onopen = () => { sendControl({ type: 'hello', features: ['batch-v1', 'limits-v2'] }); showSAS(pc).catch(err => { notify(err.message, true); resetPeer(); }); };
   dc.onclose = () => { if (state.dc === dc) { resetPeer(); status('连接中断'); notify('对方已断开连接。双方保持页面打开，并重新配对。', true); } };
   dc.onerror = () => { if (state.dc === dc) notify('传输通道发生错误，请重试。'); };
   dc.onmessage = event => {
@@ -209,7 +230,10 @@ function touchReceive(receiver) {
   }, 90000);
 }
 async function control(message) {
-  if (message.type === 'hello') { state.peerBatch = Array.isArray(message.features) && message.features.includes('batch-v1'); return; }
+  if (message.type === 'hello') {
+    state.peerBatch = Array.isArray(message.features) && message.features.includes('batch-v1');
+    state.peerLargeFiles = Array.isArray(message.features) && message.features.includes('limits-v2'); return;
+  }
   if (message.type === 'verify') { state.peerVerified = true; setReady(); return; }
   if (!state.connected) return;
   if (typeof message.type === 'string' && message.type.startsWith('batch-')) { await batchControl(message); return; }
@@ -240,9 +264,8 @@ async function control(message) {
       batch.item.current.textContent = `正在接收 ${batch.completed + 1}/${batch.files.length}：${message.name}`;
       sendControl({ type: 'file-accept', id: message.id }); touchReceive(receiver); return;
     }
-    // Cap retained downloads so repeated accepted transfers cannot grow browser memory without bound.
-    if (state.receiving || state.receivedBytes + message.size > MAX_RETAINED) {
-      sendControl({ type: 'file-reject', id: message.id }); notify('请先完成当前接收；本页最多暂存 300 MiB，保存文件后可刷新重新配对。'); return;
+    if (state.receiving) {
+      sendControl({ type: 'file-reject', id: message.id }); notify('请先完成当前接收，再发送下一个任务。'); return;
     }
     const entry = item(message.name || '未命名文件', `${formatSize(message.size)} · 来自另一台设备`);
     const receiver = { ...message, item: entry, chunks: [], bytes: 0, accepted: false };
@@ -277,9 +300,7 @@ async function control(message) {
       batchProgress(batch); setItemResult(batch.item, `已校验 ${batch.completed}/${batch.files.length} 个文件`);
       sendControl({ type: 'file-ok', id: receiver.id }); batchWait(batch); return;
     }
-    const url = URL.createObjectURL(blob); state.urls.add(url); state.receivedBytes += receiver.size;
-    const link = document.createElement('a'); link.href = url; link.download = receiver.name.replace(/[\/\\\x00-\x1f]/g, '_') || 'download';
-    link.textContent = '下载保存 ↓'; link.className = 'download'; receiver.item.actions.replaceChildren(link);
+    attachDownload(receiver.item, blob, receiver.name.replace(/[\/\\\x00-\x1f]/g, '_') || 'download', '下载保存 ↓', receiver.size);
     progress(receiver.item).value = 1; setItemResult(receiver.item, '已接收 · SHA-256 校验通过，请点击下载保存。', 'success');
     sendControl({ type: 'file-ok', id: receiver.id }); state.receiving = null;
   }
@@ -296,19 +317,20 @@ async function batchControl(message) {
   if (message.type === 'batch-meta') {
     const validId = value => typeof value === 'string' && value.length > 0 && value.length <= 80;
     const files = message.files;
-    if (!validId(message.id) || !Array.isArray(files) || files.length < 2 || files.length > 50 ||
+    if (!validId(message.id) || !Array.isArray(files) || files.length < 1 || files.length > MAX_BATCH_FILES ||
       new TextEncoder().encode(JSON.stringify(message)).length > 48000 ||
       !files.every(file => file && validId(file.id) && typeof file.name === 'string' && file.name.length > 0 && file.name.length <= 512 && Number.isSafeInteger(file.size) && file.size >= 0 && file.size <= MAX_FILE) ||
       new Set(files.map(file => file.id)).size !== files.length || !Number.isSafeInteger(message.total) ||
-      message.total !== files.reduce((sum, file) => sum + file.size, 0) || message.total > MAX_RETAINED) {
+      message.total !== files.reduce((sum, file) => sum + file.size, 0) || message.total > MAX_BATCH ||
+      (message.part && (!validId(message.part.id) || !Number.isSafeInteger(message.part.index) || !Number.isSafeInteger(message.part.total) || message.part.index < 1 || message.part.index > message.part.total))) {
       if (validId(message.id)) sendControl({ type: 'batch-reject', id: message.id });
       notify('这组文件的清单或大小不符合要求，已拒绝接收。'); return;
     }
-    if (state.receiving || state.incomingBatch || state.receivedBytes + message.total > MAX_RETAINED) {
-      sendControl({ type: 'batch-reject', id: message.id }); notify('请先完成当前接收；本页最多暂存 300 MiB 文件，保存后可刷新重新配对。'); return;
+    if (state.receiving || state.incomingBatch) {
+      sendControl({ type: 'batch-reject', id: message.id }); notify('请先完成当前接收，再发送下一组文件。'); return;
     }
-    const entry = batchItem(files, 'inbox'); entry.root.dataset.batchId = message.id;
-    const batch = { id: message.id, files, total: message.total, item: entry, blobs: [], completed: 0, completedBytes: 0, accepted: false };
+    const entry = batchItem(files, 'inbox', message.part); entry.root.dataset.batchId = message.id;
+    const batch = { id: message.id, files, total: message.total, part: message.part, item: entry, blobs: [], completed: 0, completedBytes: 0, accepted: false };
     state.incomingBatch = batch; batchWait(batch, 90000); setItemResult(entry, '正在准备整组接收…');
     try { batch.archive = await archiveAPI(); }
     catch {
@@ -337,11 +359,11 @@ async function batchControl(message) {
       sendControl({ type: 'batch-error', id: batch.id }); finishBatchReceive('这组文件未接收完整，没有生成下载压缩包。'); return;
     }
     clearTimeout(batch.timer); setItemResult(batch.item, '全部校验通过，正在生成压缩包…');
-    const folder = `QuickDrop-${new Date().toISOString().replace(/[-:]/g, '').slice(0, 15).replace('T', '-')}-${batch.id.slice(0, 6)}`;
+    const partName = batch.part?.total > 1 ? `-第${String(batch.part.index).padStart(String(batch.part.total).length, '0')}组` : '';
+    const folder = `QuickDrop-${new Date().toISOString().replace(/[-:]/g, '').slice(0, 15).replace('T', '-')}${partName}-${batch.id.slice(0, 6)}`;
     const zip = batch.archive.createZip(batch.blobs, folder);
-    const url = URL.createObjectURL(zip); state.urls.add(url); state.receivedBytes += batch.total;
-    const link = document.createElement('a'); link.href = url; link.download = `${folder}.zip`; link.className = 'download'; link.textContent = '打包下载 ZIP ↓';
-    batch.item.actions.replaceChildren(link); progress(batch.item).value = 1; batch.item.details.open = false;
+    attachDownload(batch.item, zip, `${folder}.zip`, '打包下载 ZIP ↓', batch.total);
+    progress(batch.item).value = 1; batch.item.details.open = false;
     batch.item.current.textContent = '解压后是一个文件夹，内含这次传输的全部文件。';
     setItemResult(batch.item, `${batch.files.length} 个文件全部接收并校验通过，请统一下载保存。`, 'success');
     batch.blobs = []; state.incomingBatch = null;
@@ -395,7 +417,7 @@ function waitBuffer(dc, signal) {
 }
 async function sendOne(file, batch = null) {
   const entry = batch ? batch.item : item(file.name, formatSize(file.size), 'outgoing');
-  if (file.size > MAX_FILE) { setItemResult(entry, '超过单文件 100 MiB 上限。', 'error'); return; }
+  if (file.size > MAX_FILE) { setItemResult(entry, '超过单文件 512 MiB 上限。', 'error'); return false; }
   const transfer = { id: batch ? batch.files[batch.completed].id : crypto.randomUUID(), abort: batch ? batch.abort : new AbortController(), accept: deferred(), done: deferred() };
   state.outgoing = transfer;
   const dc = state.dc, generation = state.generation;
@@ -434,22 +456,24 @@ async function sendOne(file, batch = null) {
       progress(entry).value = 1;
       setItemResult(entry, `对方已接收并通过校验 · ${((performance.now() - started) / 1000).toFixed(1)} 秒 · 等待对方自行下载保存`, 'success');
     }
+    return true;
   } catch (err) {
     if (batch) throw err;
     setItemResult(entry, err.message || '发送失败。', 'error');
     if (state.dc === dc && dc?.readyState === 'open') { try { sendControl({ type: 'file-cancel', id: transfer.id }); } catch {} }
+    return false;
   } finally { cancel?.remove(); if (state.outgoing === transfer) state.outgoing = null; }
 }
-async function sendBatch(files) {
-  const entry = batchItem(files, 'outgoing');
+async function sendBatch(files, part) {
+  const entry = batchItem(files, 'outgoing', part);
   const batch = { id: crypto.randomUUID(), files: files.map(file => ({ id: crypto.randomUUID(), name: file.name, size: file.size })),
     total: files.reduce((sum, file) => sum + file.size, 0), item: entry, completed: 0, completedBytes: 0,
     abort: new AbortController(), accept: deferred(), done: deferred() };
   entry.root.dataset.batchId = batch.id;
-  if (files.some(file => file.size > MAX_FILE)) { setItemResult(entry, '这组包含超过 100 MiB 的文件，整组未发送。', 'error'); return; }
-  if (batch.total > MAX_RETAINED) { setItemResult(entry, '这组文件总大小超过 300 MiB，请分组发送。', 'error'); return; }
-  const meta = { type: 'batch-meta', id: batch.id, total: batch.total, files: batch.files };
-  if (new TextEncoder().encode(JSON.stringify(meta)).length > 48000) { setItemResult(entry, '文件名清单过长，请减少文件数量后重试。', 'error'); return; }
+  if (files.some(file => file.size > MAX_FILE)) { setItemResult(entry, '这组包含超过 512 MiB 的文件，整组未发送。', 'error'); return false; }
+  if (batch.total > MAX_BATCH || files.length > MAX_BATCH_FILES) { setItemResult(entry, '这组文件超过 1024 MiB 或 50 个文件，未发送。', 'error'); return false; }
+  const meta = { type: 'batch-meta', id: batch.id, total: batch.total, files: batch.files, part };
+  if (new TextEncoder().encode(JSON.stringify(meta)).length > 48000) { setItemResult(entry, '文件名清单过长，请减少文件数量后重试。', 'error'); return false; }
   state.outgoingBatch = batch;
   const dc = state.dc;
   const cancel = button('取消整组发送', () => batch.abort.abort(new Error('已取消这组文件的发送。'))); entry.actions.append(cancel);
@@ -461,17 +485,32 @@ async function sendBatch(files) {
     await waitFor(batch.done.promise, batch.abort.signal, 180000, '等待整组完成确认超时，请重试。');
     entry.current.textContent = ''; entry.details.open = false;
     setItemResult(entry, `对方已接收 ${files.length} 个文件并通过全部校验，可统一下载压缩包。`, 'success');
+    return true;
   } catch (err) {
     stopBatchRows(batch); entry.current.textContent = ''; setItemResult(entry, err.message || '这组文件发送失败。', 'error');
     if (state.dc === dc && dc?.readyState === 'open') { try { sendControl({ type: 'batch-cancel', id: batch.id }); } catch {} }
+    return false;
   } finally { cancel.remove(); if (state.outgoingBatch === batch) state.outgoingBatch = null; }
 }
 async function sendFiles(files) {
   if (!files.length || !state.connected || state.sending) return;
-  if (files.length > 50) { notify('一次最多选择 50 个文件。'); return; }
   if (files.length > 1 && !state.peerBatch) { notify('对方仍在使用旧版页面，请双方刷新并重新配对后使用整组传输。'); return; }
+  let groups;
+  try { groups = planTransfers(files); }
+  catch (error) { const entry = item('这次选择未发送', '', 'outgoing'); setItemResult(entry, error.message, 'error'); $('files').value = ''; return; }
+  if (!state.peerLargeFiles && (files.some(file => file.size > 100 * MIB) || groups.some(group => group.total > 300 * MIB) || groups.length > 1)) {
+    notify('对方仍使用旧版大小限制，请双方刷新页面并重新配对。'); return;
+  }
+  const selection = crypto.randomUUID();
+  if (groups.length > 1) notify(`已按文件名自然排序，自动拆成 ${groups.length} 组；每组最多 1024 MiB、50 个文件。`);
   state.sending = true; setReady();
-  try { if (files.length > 1) await sendBatch(files); else await sendOne(files[0]); }
+  try {
+    for (let index = 0; index < groups.length; index++) {
+      if (!state.connected) break;
+      const ok = files.length > 1 ? await sendBatch(groups[index].files, { id: selection, index: index + 1, total: groups.length }) : await sendOne(groups[index].files[0]);
+      if (!ok) { if (index + 1 < groups.length) notify(`本组未完成，后续 ${groups.length - index - 1} 组已停止发送。`); break; }
+    }
+  }
   finally { state.sending = false; $('files').value = ''; setReady(); }
 }
 async function copy(value) {

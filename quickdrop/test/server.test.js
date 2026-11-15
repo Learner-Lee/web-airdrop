@@ -26,6 +26,7 @@ test('HTTP routes, CSP, QR validation, and method restrictions', async () => {
   assert.match(page.headers.get('content-security-policy'), /frame-ancestors 'none'/);
   assert.equal((await fetch(`${origin}/quickdrop/healthz`)).status, 200);
   const archive = await fetch(`${origin}/quickdrop/archive.js`); assert.equal(archive.status, 200); assert.match(archive.headers.get('content-type'), /javascript/);
+  const policy = await fetch(`${origin}/quickdrop/transfer-plan.js`); assert.equal(policy.status, 200); assert.match(policy.headers.get('content-type'), /javascript/);
   assert.equal((await fetch(`${origin}/quickdrop/qr?room=bad`)).status, 400);
   assert.equal((await fetch(`${origin}/quickdrop/../server.js`)).status, 404);
   assert.equal((await fetch(`${origin}/quickdrop/`, { method: 'POST' })).status, 405);

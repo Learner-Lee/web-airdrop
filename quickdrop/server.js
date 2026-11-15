@@ -70,6 +70,7 @@ const server = http.createServer(async (req, res) => {
     const files = { [`${base}/`]: ['index.html', 'text/html; charset=utf-8'],
       [`${base}/app.js`]: ['app.js', 'text/javascript; charset=utf-8'],
       [`${base}/archive.js`]: ['archive.js', 'text/javascript; charset=utf-8'],
+      [`${base}/transfer-plan.js`]: ['transfer-plan.js', 'text/javascript; charset=utf-8'],
       [`${base}/style.css`]: ['style.css', 'text/css; charset=utf-8'],
       [`${base}/cover.svg`]: ['cover.svg', 'image/svg+xml'] };
     const file = files[url.pathname];
